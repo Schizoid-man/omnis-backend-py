@@ -1,6 +1,6 @@
-// Use the same host as the frontend, but on port 8000
-const API_BASE = `http://${window.location.hostname}:8000`;
-const WS_BASE  = `ws://${window.location.hostname}:8000`;
+// Use the same host (and port) as the frontend
+const API_BASE = `${window.location.protocol}//${window.location.host}`;
+const WS_BASE  = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`;
 
 // Debug: Log API base URL (check browser console on phone)
 console.log('API_BASE:', API_BASE);
@@ -297,6 +297,65 @@ const Crypto = {
         const plaintextBuffer = await this.decryptAESGCM(epochKey, ciphertext, nonce);
         const decoder = new TextDecoder();
         return decoder.decode(plaintextBuffer);
+    },
+
+    // ── File encryption helpers ─────────────────────────────────────────────
+
+    async generateFileKey() {
+        return crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+    },
+
+    async encryptFile(data, key) {
+        const nonce = this.randomBytes(12);
+        const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, key, data);
+        return { ciphertext: new Uint8Array(ciphertext), nonce };
+    },
+
+    async decryptFile(ciphertext, nonce, key) {
+        const ct = ciphertext instanceof ArrayBuffer ? ciphertext : ciphertext.buffer;
+        return crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce }, key, ct);
+    },
+
+    async exportFileKey(key) {
+        return this.arrayBufferToBase64(await crypto.subtle.exportKey('raw', key));
+    },
+
+    async importFileKey(base64) {
+        return crypto.subtle.importKey(
+            'raw',
+            this.base64ToArrayBuffer(base64),
+            { name: 'AES-GCM', length: 256 },
+            false,
+            ['decrypt']
+        );
+    },
+
+    // Build the plaintext JSON envelope for a media message
+    buildMediaPlaintext(caption, mediaId, fileKeyB64, fileNonceB64, fileType, filename) {
+        return JSON.stringify({
+            type: 'media',
+            text: caption,
+            media_id: mediaId,
+            file_key: fileKeyB64,
+            file_nonce: fileNonceB64,
+            file_type: fileType,
+            filename
+        });
+    },
+
+    // Parse a message body – returns { isMedia, text, ... } or { isMedia: false, text }
+    parseMessageBody(body) {
+        if (!body) return { isMedia: false, text: '' };
+        try {
+            const o = JSON.parse(body);
+            // Primary check: explicit type field
+            if (o && o.type === 'media') return { isMedia: true, ...o };
+            // Fallback: JSON has file_key + media_id but type field may be missing/different
+            if (o && o.file_key && o.media_id != null) {
+                return { isMedia: true, type: 'media', ...o };
+            }
+        } catch (_) { /* plain text */ }
+        return { isMedia: false, text: body };
     }
 };
 
@@ -384,6 +443,9 @@ let currentChatPeer = null; // username of peer in current chat
 let chatSocket = null;       // active WebSocket for current chat
 let wsReconnectTimer = null; // reconnect timer handle
 let currentReplyMessage = null;
+let pendingAttachment = null; // { file, fileType, previewUrl }
+let ephemeralSeconds = 0;     // 0 = no timer; >0 = self-destruct after N seconds
+const mediaCache = new Map(); // media_id (number) -> object URL of decrypted blob
 
 // ==================== DOM ELEMENTS ====================
 
@@ -407,6 +469,15 @@ const newChatUsername = document.getElementById('new-chat-username');
 const newChatBtn = document.getElementById('new-chat-btn');
 const logoutBtn = document.getElementById('logout-btn');
 const tabBtns = document.querySelectorAll('.tab-btn');
+// Attachment UI
+const fileInput = document.getElementById('file-input');
+const attachBtn = document.getElementById('attach-btn');
+const attachmentPreviewBar = document.getElementById('attachment-preview-bar');
+const attachmentPreviewContent = document.getElementById('attachment-preview-content');
+const attachmentCancelBtn = document.getElementById('attachment-cancel-btn');
+// Timer UI
+const timerBtn = document.getElementById('timer-btn');
+const timerDropdown = document.getElementById('timer-dropdown');
 
 // ==================== INITIALIZATION ====================
 
@@ -491,6 +562,53 @@ function setupEventListeners() {
     // Close modal when clicking outside
     document.getElementById('account-modal').addEventListener('click', (e) => {
         if (e.target.id === 'account-modal') closeAccountModal();
+    });
+
+    // Attachment: open file picker
+    if (attachBtn) attachBtn.addEventListener('click', () => fileInput && fileInput.click());
+
+    // Attachment: file selected from picker
+    if (fileInput) {
+        fileInput.addEventListener('change', () => {
+            const file = fileInput.files && fileInput.files[0];
+            if (file) setAttachment(file);
+            fileInput.value = ''; // reset so same file can be re-selected
+        });
+    }
+
+    // Attachment: cancel preview
+    if (attachmentCancelBtn) attachmentCancelBtn.addEventListener('click', clearAttachment);
+
+    // Clipboard paste (images / files)
+    document.addEventListener('paste', handleGlobalPaste);
+
+    // Timer button toggle
+    if (timerBtn) {
+        timerBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            timerDropdown.classList.toggle('hidden');
+        });
+    }
+
+    // Timer option selection
+    if (timerDropdown) {
+        timerDropdown.querySelectorAll('.timer-option').forEach(btn => {
+            btn.addEventListener('click', () => {
+                ephemeralSeconds = parseInt(btn.dataset.seconds, 10);
+                timerDropdown.querySelectorAll('.timer-option').forEach(b => b.classList.remove('selected'));
+                btn.classList.add('selected');
+                timerDropdown.classList.add('hidden');
+                updateTimerBtn();
+            });
+        });
+    }
+
+    // Close timer dropdown when clicking outside
+    document.addEventListener('click', (e) => {
+        if (timerDropdown && !timerDropdown.classList.contains('hidden') &&
+            !timerDropdown.contains(e.target) && e.target !== timerBtn) {
+            timerDropdown.classList.add('hidden');
+        }
     });
 }
 
@@ -666,6 +784,11 @@ function clearChatUi() {
     chatWithUser.textContent = 'Chat';
     messageInput.value = '';
     clearReplyTarget();
+    clearAttachment();
+    clearTimerSelection();
+    // Revoke cached media object URLs
+    mediaCache.forEach(url => URL.revokeObjectURL(url));
+    mediaCache.clear();
     chatView.classList.add('hidden');
     chatPlaceholder.classList.remove('hidden');
 }
@@ -726,6 +849,7 @@ function renderChatList(chats) {
     chats.forEach(chat => {
         const item = document.createElement('div');
         item.className = 'chat-item' + (chat.chat_id === currentChatId ? ' active' : '');
+        item.dataset.chatId = chat.chat_id;
         item.innerHTML = `<span class="username">${escapeHtml(chat.with_user)}</span>`;
         item.addEventListener('click', () => openChat(chat.chat_id, chat.with_user));
         chatList.appendChild(item);
@@ -876,17 +1000,21 @@ async function openChat(chatId, username) {
     currentChatId = chatId;
     currentChatPeer = username;
     clearReplyTarget();
+    clearAttachment();
+    clearTimerSelection();
+    // Revoke cached media blobs from the previous chat
+    mediaCache.forEach(url => URL.revokeObjectURL(url));
+    mediaCache.clear();
     
     // Update UI
     chatPlaceholder.classList.add('hidden');
     chatView.classList.remove('hidden');
     chatWithUser.textContent = username;
     
-    // Update active state in list
+    // Update active state in list using data-chat-id
     document.querySelectorAll('.chat-item').forEach(item => {
-        item.classList.remove('active');
+        item.classList.toggle('active', parseInt(item.dataset.chatId) === chatId);
     });
-    event?.target?.closest('.chat-item')?.classList.add('active');
 
     // Pre-fetch peer's public key
     try {
@@ -963,6 +1091,9 @@ function renderMessages(messages) {
         const isSent = msg.sender_id === currentUserId;
         const div = document.createElement('div');
         div.className = `message ${isSent ? 'sent' : 'received'}`;
+        div.dataset.msgId = msg.id;
+        div.dataset.senderId = msg.sender_id;
+        div.dataset.rawBody = msg.body;
         
         const time = parseUTCDate(msg.created_at).toLocaleTimeString([], { 
             hour: '2-digit', 
@@ -973,7 +1104,7 @@ function renderMessages(messages) {
         if (msg.reply_id) {
             const replyTarget = messageMap.get(msg.reply_id);
             const replySender = replyTarget ? getSenderLabel(replyTarget.sender_id) : 'Original message';
-            const replyText = replyTarget ? getReplyPreviewText(replyTarget.body, 140) : '[Original message unavailable]';
+            const replyText = replyTarget ? getReplyPreviewText(getMessageDisplayText(replyTarget.body), 140) : '[Original message unavailable]';
             replyHtml = `
                 <div class="reply-snippet">
                     <div class="reply-snippet-label">${escapeHtml(replySender)}</div>
@@ -984,26 +1115,27 @@ function renderMessages(messages) {
 
         div.innerHTML = `
             ${replyHtml}
-            <div class="text">${escapeHtml(msg.body)}</div>
+            ${buildMessageHtml(msg)}
             <div class="time">${time}</div>
         `;
 
+        attachDownloadHandlers(div);
+        if (msg.expires_at) startEphemeralCountdown(div, msg.expires_at);
+
         const actions = document.createElement('div');
         actions.className = 'message-actions';
-
-        const replyBtn = document.createElement('button');
-        replyBtn.type = 'button';
-        replyBtn.className = 'reply-btn';
-        replyBtn.title = 'Reply';
-        replyBtn.innerHTML = '<i class="fa-solid fa-reply"></i>';
-        replyBtn.addEventListener('click', (event) => {
+        const replyActionBtn = document.createElement('button');
+        replyActionBtn.type = 'button';
+        replyActionBtn.className = 'reply-btn';
+        replyActionBtn.title = 'Reply';
+        replyActionBtn.innerHTML = '<i class="fa-solid fa-reply"></i>';
+        replyActionBtn.addEventListener('click', (event) => {
             event.stopPropagation();
             setReplyTarget(msg);
         });
-
-        actions.appendChild(replyBtn);
+        actions.appendChild(replyActionBtn);
         div.appendChild(actions);
-        
+
         messagesContainer.appendChild(div);
     });
 
@@ -1011,9 +1143,382 @@ function renderMessages(messages) {
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
 }
 
+// ==================== ATTACHMENT HELPERS ====================
+
+function updateTimerBtn() {
+    if (!timerBtn) return;
+    const badge = timerBtn.querySelector('.timer-badge');
+    if (ephemeralSeconds > 0) {
+        timerBtn.classList.add('active');
+        const label = formatDuration(ephemeralSeconds);
+        if (badge) {
+            badge.textContent = label;
+        } else {
+            const b = document.createElement('span');
+            b.className = 'timer-badge';
+            b.textContent = label;
+            timerBtn.appendChild(b);
+        }
+    } else {
+        timerBtn.classList.remove('active');
+        if (badge) badge.remove();
+    }
+}
+
+function clearTimerSelection() {
+    ephemeralSeconds = 0;
+    if (timerDropdown) {
+        timerDropdown.querySelectorAll('.timer-option').forEach(b => b.classList.remove('selected'));
+        timerDropdown.classList.add('hidden');
+    }
+    updateTimerBtn();
+}
+
+function getEphemeralExpiry() {
+    if (!ephemeralSeconds) return null;
+    return new Date(Date.now() + ephemeralSeconds * 1000).toISOString();
+}
+
+function formatDuration(secs) {
+    if (secs < 60) return `${secs}s`;
+    if (secs < 3600) return `${Math.round(secs / 60)}m`;
+    return `${Math.round(secs / 3600)}h`;
+}
+
+function classifyExtension(ext) {
+    const e = ext.toLowerCase();
+    if (['jpg','jpeg','png','gif','webp','bmp','svg','ico'].includes(e)) return 'image';
+    if (['mp4','webm','mov','avi','mkv'].includes(e)) return 'video';
+    if (['mp3','wav','ogg','flac','aac'].includes(e)) return 'audio';
+    if (['pdf','doc','docx','xls','xlsx','ppt','pptx','txt','csv','md'].includes(e)) return 'document';
+    return 'file';
+}
+
+function getFileTypeIcon(fileType) {
+    switch (fileType) {
+        case 'image':    return '<i class="fa-solid fa-image"></i>';
+        case 'video':    return '<i class="fa-solid fa-film"></i>';
+        case 'audio':    return '<i class="fa-solid fa-music"></i>';
+        case 'document': return '<i class="fa-solid fa-file-lines"></i>';
+        default:         return '<i class="fa-solid fa-file"></i>';
+    }
+}
+
+function formatFileSize(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function setAttachment(file) {
+    if (pendingAttachment && pendingAttachment.previewUrl) {
+        URL.revokeObjectURL(pendingAttachment.previewUrl);
+    }
+    const ext = file.name.includes('.') ? file.name.split('.').pop() : '';
+    const fileType = classifyExtension(ext);
+    const previewUrl = URL.createObjectURL(file);
+    pendingAttachment = { file, fileType, previewUrl };
+    renderAttachmentPreview();
+}
+
+function clearAttachment() {
+    if (pendingAttachment && pendingAttachment.previewUrl) {
+        URL.revokeObjectURL(pendingAttachment.previewUrl);
+    }
+    pendingAttachment = null;
+    if (attachmentPreviewBar) attachmentPreviewBar.classList.add('hidden');
+    if (attachmentPreviewContent) attachmentPreviewContent.innerHTML = '';
+}
+
+function renderAttachmentPreview() {
+    if (!pendingAttachment || !attachmentPreviewContent) return;
+    const { file, fileType, previewUrl } = pendingAttachment;
+    attachmentPreviewContent.innerHTML = '';
+
+    if (fileType === 'image') {
+        const img = document.createElement('img');
+        img.src = previewUrl;
+        img.className = 'preview-image';
+        img.alt = file.name;
+        attachmentPreviewContent.appendChild(img);
+    } else {
+        const fileDiv = document.createElement('div');
+        fileDiv.className = 'preview-file';
+        fileDiv.innerHTML = `
+            <span class="preview-icon">${getFileTypeIcon(fileType)}</span>
+            <div class="preview-info">
+                <span class="preview-name">${escapeHtml(file.name)}</span>
+                <span class="preview-size">${formatFileSize(file.size)}</span>
+            </div>
+        `;
+        attachmentPreviewContent.appendChild(fileDiv);
+    }
+
+    attachmentPreviewBar.classList.remove('hidden');
+}
+
+function handleGlobalPaste(e) {
+    // Only intercept when a chat is open and we're not in another input
+    if (!currentChatId) return;
+    if (e.target !== document.body && e.target !== messageInput &&
+        !messageForm.contains(e.target)) return;
+
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+
+    for (const item of items) {
+        if (item.kind === 'file') {
+            const file = item.getAsFile();
+            if (file) {
+                e.preventDefault();
+                setAttachment(file);
+                return;
+            }
+        }
+    }
+}
+
+// Build HTML for the body section of a message (handles plain text + media envelopes)
+function buildMessageHtml(msg) {
+    const parsed = Crypto.parseMessageBody(msg.body);
+    const expiryBadge = msg.expires_at
+        ? `<div class="ephemeral-badge"><i class="fa-regular fa-clock"></i> …</div>`
+        : '';
+
+    if (!parsed.isMedia) {
+        return `<div class="text">${escapeHtml(parsed.text || msg.body)}</div>${expiryBadge}`;
+    }
+
+    // Media envelope
+    const { text, media_id, file_key, file_nonce, file_type, filename } = parsed;
+    const captionHtml = text ? `<div class="text">${escapeHtml(text)}</div>` : '';
+
+    let mediaHtml = '';
+    if (file_type === 'image') {
+        mediaHtml = `
+            <div class="attachment-msg">
+                <div class="img-loading-wrap" data-media-id="${escapeHtml(String(media_id))}">
+                    <img class="attachment-image-preview"
+                         src=""
+                         alt="${escapeHtml(filename || 'image')}"
+                         data-media-id="${escapeHtml(String(media_id))}"
+                         data-file-key="${escapeHtml(file_key)}"
+                         data-file-nonce="${escapeHtml(file_nonce)}"
+                         data-filename="${escapeHtml(filename || 'image')}">
+                    <span class="img-loading-hint">Loading image…</span>
+                </div>
+                <button class="download-btn"
+                        data-media-id="${escapeHtml(String(media_id))}"
+                        data-file-key="${escapeHtml(file_key)}"
+                        data-file-nonce="${escapeHtml(file_nonce)}"
+                        data-filename="${escapeHtml(filename || 'file')}">
+                    <i class="fa-solid fa-download"></i> Save image
+                </button>
+            </div>`;
+    } else {
+        const icon = getFileTypeIcon(file_type || 'file');
+        mediaHtml = `
+            <div class="attachment-msg">
+                <div class="attachment-file">
+                    <span>${icon}</span>
+                    <span class="attachment-filename">${escapeHtml(filename || 'file')}</span>
+                </div>
+                <button class="download-btn"
+                        data-media-id="${escapeHtml(String(media_id))}"
+                        data-file-key="${escapeHtml(file_key)}"
+                        data-file-nonce="${escapeHtml(file_nonce)}"
+                        data-filename="${escapeHtml(filename || 'file')}">
+                    <i class="fa-solid fa-download"></i> Download
+                </button>
+            </div>`;
+    }
+
+    return captionHtml + mediaHtml + expiryBadge;
+}
+
+// Attach download-btn click handlers to a message element
+function attachDownloadHandlers(div) {
+    div.querySelectorAll('.download-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const { mediaId, fileKey, fileNonce, filename } = btn.dataset;
+            await downloadMedia(mediaId, fileKey, fileNonce, filename, btn);
+        });
+    });
+    // Auto-load image previews (use cache if available, otherwise download + cache)
+    div.querySelectorAll('img.attachment-image-preview[data-media-id]').forEach(img => {
+        const numId = Number(img.dataset.mediaId);
+        const wrap = img.closest('.img-loading-wrap');
+        const hint = wrap ? wrap.querySelector('.img-loading-hint') : null;
+        const setLoaded = (url) => {
+            img.src = url;
+            if (hint) hint.style.display = 'none';
+        };
+        const setError = () => {
+            if (hint) hint.textContent = '⚠️ Could not load image — click Save to download';
+        };
+        if (mediaCache.has(numId)) {
+            setLoaded(mediaCache.get(numId));
+        } else {
+            const { mediaId, fileKey, fileNonce, filename } = img.dataset;
+            downloadMedia(mediaId, fileKey, fileNonce, filename, null)
+                .then(() => {
+                    if (mediaCache.has(numId)) setLoaded(mediaCache.get(numId));
+                    else setError();
+                })
+                .catch(setError);
+        }
+    });
+}
+
+async function downloadMedia(mediaId, fileKeyB64, fileNonceB64, filename, btnEl) {
+    // Serve from in-memory cache if already decrypted
+    const numId = Number(mediaId);
+    if (mediaCache.has(numId) && !btnEl) {
+        return fetch(mediaCache.get(numId)).then(r => r.blob());
+    }
+
+    if (btnEl) {
+        btnEl.disabled = true;
+        btnEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Downloading…';
+    }
+    try {
+        const resp = await fetch(`${API_BASE}/media/${encodeURIComponent(mediaId)}`, {
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'X-Device-ID': deviceId
+            }
+        });
+        if (!resp.ok) throw new Error('Download failed');
+
+        const encryptedData = await resp.arrayBuffer();
+        const key = await Crypto.importFileKey(fileKeyB64);
+        const nonce = new Uint8Array(Crypto.base64ToArrayBuffer(fileNonceB64));
+        const decrypted = await Crypto.decryptFile(new Uint8Array(encryptedData), nonce, key);
+        const blob = new Blob([decrypted]);
+
+        // Cache the object URL for subsequent renders
+        if (!mediaCache.has(numId)) {
+            mediaCache.set(numId, URL.createObjectURL(blob));
+        }
+
+        if (btnEl) {
+            const url = mediaCache.get(numId);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename || 'download';
+            a.click();
+            btnEl.disabled = false;
+            btnEl.innerHTML = '<i class="fa-solid fa-download"></i> Download';
+        }
+        return blob;
+    } catch (err) {
+        console.error('Download error:', err);
+        if (btnEl) {
+            btnEl.disabled = false;
+            btnEl.innerHTML = '<i class="fa-solid fa-download"></i> Retry';
+        }
+        return null;
+    }
+}
+
+async function sendMediaMessage(caption, replyId) {
+    const { file, fileType } = pendingAttachment;
+
+    // Read and encrypt file bytes
+    const fileBytes = await file.arrayBuffer();
+    const fileKey = await Crypto.generateFileKey();
+    const { ciphertext: encBytes, nonce: fileNonce } = await Crypto.encryptFile(fileBytes, fileKey);
+    const fileKeyB64 = await Crypto.exportFileKey(fileKey);
+    const fileNonceB64 = Crypto.arrayBufferToBase64(fileNonce.buffer);
+
+    const CHUNK = 512 * 1024; // 512 KB per chunk
+    const totalChunks = Math.ceil(encBytes.length / CHUNK);
+
+    // 1. Init upload session
+    const initResp = await apiCall('/media/upload/init', {
+        method: 'POST',
+        body: JSON.stringify({
+            chat_id: currentChatId,
+            file_type: fileType,
+            total_chunks: totalChunks,
+            total_size: encBytes.length,
+            chunk_size: CHUNK,
+        })
+    });
+    const uploadId = initResp.upload_id;
+
+    // 2. Upload each chunk as raw bytes via PUT
+    for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK;
+        const chunkBytes = encBytes.slice(start, start + CHUNK);
+        const r = await fetch(`${API_BASE}/media/upload/${uploadId}/chunk/${i}`, {
+            method: 'PUT',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'X-Device-ID': deviceId,
+                'Content-Type': 'application/octet-stream',
+            },
+            body: chunkBytes,
+        });
+        if (!r.ok) throw new Error(`Chunk ${i} upload failed (${r.status})`);
+    }
+
+    // 3. Finalize — returns { media_id }
+    const finalResp = await apiCall(`/media/upload/${uploadId}/finalize`, { method: 'POST' });
+    const mediaId = finalResp.media_id;
+
+    // Cache the decrypted blob URL immediately so the sender sees the image right away
+    if (fileType === 'image') {
+        const originalBlob = new Blob([fileBytes], { type: file.type || 'image/jpeg' });
+        mediaCache.set(mediaId, URL.createObjectURL(originalBlob));
+    }
+
+    // 4. Encrypt the plaintext envelope with the epoch key
+    const plaintext = Crypto.buildMediaPlaintext(caption, mediaId, fileKeyB64, fileNonceB64, fileType, file.name);
+    let epoch = KeyStore.getLatestEpoch(currentChatId);
+    if (!epoch) epoch = await getOrCreateEpoch(currentChatId, currentChatPeer);
+    const encrypted = await Crypto.encryptMessage(plaintext, epoch.key);
+
+    // 5. Post the message (with optional expiry)
+    const expiresAt = getEphemeralExpiry();
+    await apiCall(`/chat/${currentChatId}/message`, {
+        method: 'POST',
+        body: JSON.stringify({
+            epoch_id: epoch.epochId,
+            ciphertext: encrypted.ciphertext,
+            nonce: encrypted.nonce,
+            reply_id: replyId || null,
+            media_id: mediaId,
+            expires_at: expiresAt,
+        })
+    });
+
+    clearAttachment();
+    clearTimerSelection();
+    clearReplyTarget();
+    if (!chatSocket || chatSocket.readyState !== WebSocket.OPEN) {
+        await loadMessages();
+    }
+}
+
 async function sendMessage() {
     const body = messageInput.value.trim();
-    if (!body || !currentChatId || !currentChatPeer) return;
+    if (!currentChatId || !currentChatPeer) return;
+    if (!body && !pendingAttachment) return;
+
+    // If there's a pending attachment, send it as a media message
+    if (pendingAttachment) {
+        messageInput.value = '';
+        try {
+            await sendMediaMessage(body, currentReplyMessage ? currentReplyMessage.id : null);
+        } catch (err) {
+            console.error('Media send error:', err);
+            alert(err.message);
+        }
+        return;
+    }
+
+    if (!body) return;
 
     try {
         messageInput.value = '';
@@ -1029,17 +1534,24 @@ async function sendMessage() {
         // Encrypt the message
         const encrypted = await Crypto.encryptMessage(body, epoch.key);
         
+        const expiresAt = getEphemeralExpiry();
         await apiCall(`/chat/${currentChatId}/message`, {
             method: 'POST',
             body: JSON.stringify({
                 epoch_id: epoch.epochId,
                 ciphertext: encrypted.ciphertext,
                 nonce: encrypted.nonce,
-                reply_id: currentReplyMessage ? currentReplyMessage.id : null
+                reply_id: currentReplyMessage ? currentReplyMessage.id : null,
+                expires_at: expiresAt,
             })
         });
+        clearTimerSelection();
         clearReplyTarget();
-        // No need to loadMessages() — the server broadcasts via WebSocket
+        // If WebSocket is not open (e.g. connection dropped), fall back to HTTP fetch
+        if (!chatSocket || chatSocket.readyState !== WebSocket.OPEN) {
+            await loadMessages();
+        }
+        // Otherwise the server broadcasts the new message via WebSocket
     } catch (error) {
         console.error('Send message error:', error);
         
@@ -1116,6 +1628,9 @@ function connectChatWebSocket(chatId) {
             } else if (data.type === 'new_message') {
                 // Single new message pushed from server
                 await handleNewMessagePayload(data.message);
+            } else if (data.type === 'message_deleted') {
+                // Ephemeral message expired on the server
+                removeMessageFromDom(data.message_id);
             } else if (data.type === 'pong') {
                 // heartbeat ack – ignore
             }
@@ -1127,8 +1642,8 @@ function connectChatWebSocket(chatId) {
     chatSocket.addEventListener('close', (evt) => {
         console.log(`WS closed (code=${evt.code})`);
         chatSocket = null;
-        // Reconnect unless we intentionally closed or auth failed
-        if (evt.code !== 4001 && currentChatId === chatId && authToken) {
+        // Reconnect unless we intentionally closed, auth failed (4001), or chat not found (4004)
+        if (evt.code !== 4001 && evt.code !== 4004 && currentChatId === chatId && authToken) {
             wsReconnectTimer = setTimeout(() => connectChatWebSocket(chatId), 3000);
         }
     });
@@ -1242,11 +1757,43 @@ async function decryptMessageBatch(messages) {
     return decrypted;
 }
 
+// Remove a message element from the DOM by id (e.g. after server-side expiry)
+function removeMessageFromDom(msgId) {
+    const el = messagesContainer.querySelector(`.message[data-msg-id="${msgId}"]`);
+    if (el) {
+        el.style.transition = 'opacity 0.4s';
+        el.style.opacity = '0';
+        setTimeout(() => el.remove(), 420);
+    }
+}
+
+// Start a client-side countdown badge on a message div and remove it on expiry
+function startEphemeralCountdown(div, expiresAtIso) {
+    const expiresAt = new Date(expiresAtIso);
+    const badge = div.querySelector('.ephemeral-badge');
+    if (!badge) return;
+
+    const tick = () => {
+        const secsLeft = Math.ceil((expiresAt - Date.now()) / 1000);
+        if (secsLeft <= 0) {
+            removeMessageFromDom(parseInt(div.dataset.msgId, 10));
+            return;
+        }
+        badge.innerHTML = `<i class="fa-regular fa-clock"></i> ${formatDuration(secsLeft)}`;
+        if (secsLeft <= 5) div.classList.add('expiring-soon');
+        setTimeout(tick, 1000);
+    };
+    tick();
+}
+
 // Append a single decrypted message to the chat view
 function appendMessage(msg) {
     const isSent = msg.sender_id === currentUserId;
     const div = document.createElement('div');
     div.className = `message ${isSent ? 'sent' : 'received'}`;
+    div.dataset.msgId = msg.id;
+    div.dataset.senderId = msg.sender_id;
+    div.dataset.rawBody = msg.body;
 
     const time = parseUTCDate(msg.created_at).toLocaleTimeString([], {
         hour: '2-digit',
@@ -1255,21 +1802,33 @@ function appendMessage(msg) {
 
     let replyHtml = '';
     if (msg.reply_id) {
-        // Try to find the reply target already rendered
-        const existingMsgs = messagesContainer.querySelectorAll('.message');
-        // We don't have a handy map here so show minimal info
+        // Try to find the reply target from already-rendered messages
+        const allRendered = messagesContainer.querySelectorAll('.message');
+        let replySender = 'Reply';
+        let replyText = '';
+        for (const el of allRendered) {
+            if (parseInt(el.dataset.msgId) === msg.reply_id) {
+                replySender = el.dataset.senderId == currentUserId ? 'You' : (currentChatPeer || 'User');
+                replyText = el.dataset.rawBody ? getMessageDisplayText(el.dataset.rawBody) : (el.querySelector('.text')?.textContent || '');
+                break;
+            }
+        }
         replyHtml = `
             <div class="reply-snippet">
-                <div class="reply-snippet-label">Reply</div>
+                <div class="reply-snippet-label">${escapeHtml(replySender)}</div>
+                ${replyText ? `<div class="reply-snippet-text">${escapeHtml(getReplyPreviewText(replyText, 140))}</div>` : ''}
             </div>
         `;
     }
 
     div.innerHTML = `
         ${replyHtml}
-        <div class="text">${escapeHtml(msg.body)}</div>
+        ${buildMessageHtml(msg)}
         <div class="time">${time}</div>
     `;
+
+    attachDownloadHandlers(div);
+    if (msg.expires_at) startEphemeralCountdown(div, msg.expires_at);
 
     const actions = document.createElement('div');
     actions.className = 'message-actions';
@@ -1439,6 +1998,15 @@ function getReplyPreviewText(text, limit = 180) {
     const trimmed = text.trim();
     if (trimmed.length <= limit) return trimmed;
     return `${trimmed.slice(0, limit)}...`;
+}
+
+// Return a human-readable preview for a (possibly media-envelope) message body
+function getMessageDisplayText(body) {
+    const parsed = Crypto.parseMessageBody(body);
+    if (!parsed.isMedia) return parsed.text || body;
+    const caption = parsed.text ? ` "${parsed.text}"` : '';
+    const name = parsed.filename ? ` ${parsed.filename}` : '';
+    return `[Attachment${name}${caption}]`;
 }
 
 function setReplyTarget(message) {

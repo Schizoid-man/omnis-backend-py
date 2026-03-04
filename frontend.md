@@ -87,6 +87,57 @@ The server **never sees plaintext messages or identity private keys**. It only s
   - List sessions from `/users/sessions`.
   - Allow revoking individual sessions and all other sessions.
 
+### 2.6 VoIP Call Cryptography
+
+VoIP audio is end-to-end encrypted using a **per-call symmetric key** derived
+from the two parties' long-term identity keys. The server relays encrypted audio
+frames without ever having access to the audio content or the call key.
+
+#### Call Key Derivation
+
+1. Both parties already have each other's identity **public keys** (obtained via
+   `/users/{username}/key` at chat open time).
+2. The calling client performs **ECDH (P-384)** between its private identity key
+   and the peer's public identity key to obtain a shared secret.
+3. The shared secret is passed through **HKDF-SHA-256** to derive the 32-byte
+   AES-GCM call key:
+   - Salt: 32 zero bytes (same constant used for epoch key wrapping)
+   - Info: `b"call-key"` (**different** from `b"epoch-key-wrap"` — this is
+     the only difference from the epoch-key derivation path)
+   - Output length: 32 bytes
+4. The derived key is used **only** for the duration of the call and then
+   discarded. It **MUST NOT** be persisted to any storage.
+
+#### Audio Frame Format
+
+Each encrypted audio frame sent over `/call/audio/ws/{call_id}` is a binary
+message with the following layout:
+
+```
+┌───────────────┬──────────────────┬────────────────────────────┐
+│  seq  (8 B)   │  nonce  (12 B)  │  AES-GCM ciphertext + tag     │
+└───────────────┴──────────────────┴────────────────────────────┘
+```
+
+| Field | Size | Description |
+|---|---|---|
+| `seq` | 8 bytes, big-endian u64 | Monotonically increasing sequence number set by the sender; used by the receiver to detect reordering and gaps |
+| `nonce` | 12 bytes | Random AES-GCM nonce, unique per frame |
+| `ciphertext + tag` | variable | AES-256-GCM encrypted PCM audio; 16-byte GCM authentication tag appended by the AEAD |
+
+- Audio format: **48 kHz, mono, f32-LE PCM**, 1920-sample frames (40 ms per frame, 25 fps).
+- The `seq` field **MUST** increment by 1 for each frame sent.
+- The nonce **MUST** be independently random per frame (not derived from `seq`).
+- Receivers **MUST** authenticate the GCM tag before passing audio to the
+  decoder; frames that fail authentication **MUST** be silently dropped.
+- The call key **MUST NOT** be reused across separate call sessions; a fresh
+  ECDH derivation occurs at the start of each call.
+
+#### Storage Policy
+
+- The per-call AES key **MUST NOT** be stored in any persistent storage.
+- The call key lives only in process memory for the duration of the active call.
+
 ---
 
 ## 3. Frontend Behavioural Spec
@@ -386,6 +437,54 @@ runtimes.
 
 This ensures the React Native client is cryptographically equivalent to the web
 client while remaining portable, auditable, and safe to implement.
+
+---
+
+### 4.7 Call Key Derivation — All Languages
+
+The VoIP call key uses the **exactly same ECDH + HKDF primitive** as epoch key
+wrapping (Section 2.6). The only difference is the `info` string:
+
+| Purpose | `info` value |
+|---|---|
+| Epoch key wrapping | `b"epoch-key-wrap"` |
+| VoIP call key | `b"call-key"` |
+
+All other parameters (curve P-384, salt = 32 zero bytes, output = 32 bytes,
+hash = SHA-256) are identical. Refer to the language-specific HKDF and ECDH
+guidance in sections 4.1–4.6 and substitute `info = b"call-key"`.
+
+Pseudo-code (language-agnostic):
+
+```
+shared_secret = ECDH_P384(my_identity_priv, peer_identity_pub)
+call_key      = HKDF_SHA256(
+    ikm  = shared_secret,
+    salt = bytes([0] * 32),
+    info = b"call-key",
+    length = 32
+)
+```
+
+The `call_key` is then used as a 256-bit AES-GCM key for the audio frame
+encryption described in Section 2.6.
+
+**Audio frame encrypt (per frame):**
+```
+nonce = random_bytes(12)
+ciphertext_and_tag = AES256GCM_encrypt(key=call_key, nonce=nonce, plaintext=pcm_frame)
+wire_frame = seq_be_u64 || nonce || ciphertext_and_tag
+```
+
+**Audio frame decrypt (per frame):**
+```
+assert len(wire_frame) >= 20        # 8 + 12
+seq    = wire_frame[0:8]            # big-endian u64, check for ordering
+nonce  = wire_frame[8:20]
+ct_tag = wire_frame[20:]
+pcm_frame = AES256GCM_decrypt(key=call_key, nonce=nonce, ciphertext=ct_tag)
+# drop frame silently if authentication fails
+```
 
 ---
 

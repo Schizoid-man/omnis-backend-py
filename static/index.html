@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Omnis Chat</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="style.css?v=2">
 </head>
 <body>
     <div class="app-container">
@@ -78,8 +78,34 @@
                             <div id="reply-preview" class="reply-preview"></div>
                         </div>
                         <form id="message-form" class="message-form">
-                            <input type="text" id="message-input" placeholder="Type a message..." required>
-                            <button type="submit" class="btn primary">Send</button>
+                            <!-- Hidden file input triggered by the paperclip button -->
+                            <input type="file" id="file-input" accept="*/*" style="display:none">
+                            <!-- Attachment preview bar (visible when a file is staged) -->
+                            <div id="attachment-preview-bar" class="attachment-preview-bar hidden">
+                                <div id="attachment-preview-content" class="attachment-preview-content"></div>
+                                <button id="attachment-cancel-btn" class="attachment-cancel-btn" type="button" title="Remove attachment">&times;</button>
+                            </div>
+                            <!-- Timer dropdown (shown above input row when timer btn clicked) -->
+                            <div id="timer-dropdown" class="timer-dropdown hidden">
+                                <span class="timer-dropdown-label">Self-destruct after:</span>
+                                <button type="button" class="timer-option" data-seconds="0">Off</button>
+                                <button type="button" class="timer-option" data-seconds="10">10 s</button>
+                                <button type="button" class="timer-option" data-seconds="30">30 s</button>
+                                <button type="button" class="timer-option" data-seconds="60">1 min</button>
+                                <button type="button" class="timer-option" data-seconds="300">5 min</button>
+                                <button type="button" class="timer-option" data-seconds="3600">1 hr</button>
+                                <button type="button" class="timer-option" data-seconds="86400">24 hr</button>
+                            </div>
+                            <div class="input-row">
+                                <button type="button" id="attach-btn" class="attach-btn" title="Attach file (or paste with Ctrl+V)">
+                                    <i class="fa-solid fa-paperclip"></i>
+                                </button>
+                                <button type="button" id="timer-btn" class="timer-btn" title="Set self-destruct timer">
+                                    <i class="fa-regular fa-clock"></i>
+                                </button>
+                                <input type="text" id="message-input" placeholder="Type a message…" autocomplete="off">
+                                <button type="submit" class="btn primary">Send</button>
+                            </div>
                         </form>
                     </div>
                 </div>
@@ -102,6 +128,6 @@
         </div>
     </div>
 
-    <script src="app.js"></script>
+    <script src="app.js?v=2"></script>
 </body>
 </html>

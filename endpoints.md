@@ -653,6 +653,263 @@ Errors:
 
 ---
 
+## VoIP Call Endpoints
+
+All call REST endpoints require authentication. Pass the token via
+`Authorization: Bearer <token>` header (same auth scheme as other
+authenticated endpoints).
+
+---
+
+### `POST /call/initiate`
+
+Start an outgoing call to another user.
+
+**Auth:** required
+
+**Request body:**
+```json
+{
+  "callee_username": "string",
+  "chat_id": 1
+}
+```
+`chat_id` is optional (`null` allowed) — links the call to an existing chat.
+
+**Response `200`:**
+```json
+{
+  "call_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "ringing",
+  "caller_username": "alice",
+  "callee_username": "bob"
+}
+```
+
+**Side effects:**
+- Creates a `calls` row with `status = ringing`.
+- Pushes a `call_invite` frame to the callee's presence WebSocket:
+  ```json
+  {
+    "type": "call_invite",
+    "call_id": "550e8400-e29b-41d4-a716-446655440000",
+    "caller_username": "alice",
+    "initiated_at": "2025-01-01T12:00:00Z"
+  }
+  ```
+
+**Errors:**
+- `404` — callee not found
+- `409` — callee already in an active call
+
+---
+
+### `POST /call/answer`
+
+Accept an incoming call. Called by the callee after receiving a `call_invite`.
+
+**Auth:** required
+
+**Request body:**
+```json
+{
+  "call_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Response `200`:**
+```json
+{
+  "call_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "active"
+}
+```
+
+**Side effects:**
+- Sets `calls.status = active` and records `answered_at`.
+- Broadcasts `{"type": "answered"}` to all participants on `/call/ws/{call_id}`.
+
+**Errors:**
+- `403` — caller is not the callee of this call
+- `404` — call not found
+- `409` — call is not in `ringing` state
+
+---
+
+### `POST /call/reject`
+
+Reject an incoming call.
+
+**Auth:** required
+
+**Request body:**
+```json
+{
+  "call_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Response `200`:**
+```json
+{
+  "call_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "rejected"
+}
+```
+
+**Side effects:**
+- Sets `calls.status = rejected` and records `ended_at`.
+- Broadcasts `{"type": "rejected"}` to all participants on `/call/ws/{call_id}`.
+
+**Errors:**
+- `403` — caller is not the callee of this call
+- `404` — call not found
+- `409` — call is not in `ringing` state
+
+---
+
+### `POST /call/end`
+
+End an active (or ringing) call. May be called by either the caller or callee.
+
+**Auth:** required
+
+**Request body:**
+```json
+{
+  "call_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Response `200`:**
+```json
+{
+  "call_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "ended"
+}
+```
+
+**Side effects:**
+- Sets `calls.status = ended` and records `ended_at`.
+- Broadcasts `{"type": "ended"}` to all participants on `/call/ws/{call_id}`.
+
+**Errors:**
+- `403` — authenticated user is not a participant in this call
+- `404` — call not found
+- `409` — call is already ended or rejected
+
+---
+
+### `WS /user/ws`
+
+Per-user **presence** WebSocket. Delivers incoming call invitations and
+keepalive pings to the authenticated user.
+
+**Query params:**
+| Param | Required | Description |
+|---|---|---|
+| `token` | yes | Auth token |
+| `device_id` | yes | Client device identifier |
+
+**Server → Client frames (JSON):**
+
+| `type` | Sent when | Extra fields |
+|---|---|---|
+| `call_invite` | Another user calls this user (`POST /call/initiate`) | `call_id`, `caller_username`, `initiated_at` |
+| `pong` | Client sent `{"type": "ping"}` | — |
+
+**Client → Server frames (JSON):**
+
+| `type` | Description |
+|---|---|
+| `ping` | Keepalive; server replies with `pong` |
+
+**Lifecycle:** Only one presence connection is tracked per user. A new
+connection replaces any previous connection for that user.
+
+---
+
+### `WS /call/ws/{call_id}`
+
+Per-call **signaling** WebSocket. Both the caller and callee connect here after
+the call is initiated. Used for hold/unhold and terminal state notifications.
+
+**Path params:**
+| Param | Description |
+|---|---|
+| `call_id` | UUID of the call (from `POST /call/initiate`) |
+
+**Query params:**
+| Param | Required | Description |
+|---|---|---|
+| `token` | yes | Auth token |
+| `device_id` | yes | Client device identifier |
+
+**Server → Client frames (JSON):**
+
+| `type` | Meaning |
+|---|---|
+| `answered` | Callee accepted the call |
+| `rejected` | Callee rejected the call |
+| `ended` | A participant ended the call |
+| `hold` | The remote party has put the call on hold |
+| `unhold` | The remote party has resumed the call |
+
+**Client → Server frames (JSON):**
+
+| `type` | Meaning |
+|---|---|
+| `hold` | Local party puts the call on hold |
+| `unhold` | Local party resumes the call |
+| `ping` | Keepalive |
+
+**Errors:** WebSocket is closed with code `4001` if the token is invalid or
+the user is not a participant in the specified call.
+
+---
+
+### `WS /call/audio/ws/{call_id}`
+
+Per-call **binary audio relay** WebSocket. The server relays encrypted binary
+audio frames from one participant to the other without inspection or
+decryption.
+
+**Path params:**
+| Param | Description |
+|---|---|
+| `call_id` | UUID of the call |
+
+**Query params:**
+| Param | Required | Description |
+|---|---|---|
+| `token` | yes | Auth token |
+| `device_id` | yes | Client device identifier |
+
+**Frame format (binary, client → server → remote):**
+
+```
+┌───────────────┬──────────────────┬────────────────────────────┐
+│  seq  (8 B)   │  nonce  (12 B)   │  AES-GCM ciphertext + tag  │
+└───────────────┴──────────────────┴────────────────────────────┘
+```
+
+| Field | Size | Description |
+|---|---|---|
+| `seq` | 8 bytes, big-endian u64 | Monotonic sequence number; used by receiver to detect reordering |
+| `nonce` | 12 bytes | Random AES-GCM nonce |
+| `ciphertext + tag` | variable | AES-GCM encrypted audio (key derived via ECDH + HKDF) |
+
+**Behaviour:**
+- Any binary message received from participant A is forwarded verbatim to
+  participant B (and vice-versa).
+- The server never parses or decrypts audio content.
+- JSON messages are ignored on this socket.
+
+**Errors:** WebSocket is closed with code `4001` if the token is invalid or
+the user is not a participant in the specified call.
+
+---
+
 ## Notes & Non-Goals (Current State)
 
 - The server does not perform any encryption or decryption of messages; it

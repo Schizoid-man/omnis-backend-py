@@ -611,3 +611,276 @@ input:focus {
     color: var(--text-secondary);
     padding: 1rem;
 }
+
+/* ───────── Attachment UI ───────── */
+
+/* Input row: attach button + text input + send button */
+.message-form {
+    padding: 0;
+    flex-direction: column;
+    gap: 0;
+}
+
+.input-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    padding: 0.75rem 1rem;
+}
+
+.input-row input {
+    flex: 1;
+}
+
+/* Paperclip button */
+.attach-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    cursor: pointer;
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    font-size: 1rem;
+    transition: all 0.2s;
+    flex-shrink: 0;
+    line-height: 1;
+}
+
+.attach-btn:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+/* Attachment preview bar shown above input row */
+.attachment-preview-bar {
+    padding: 0.75rem 1rem;
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border);
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+}
+
+.attachment-preview-content {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.preview-image {
+    max-height: 120px;
+    max-width: 200px;
+    border-radius: 8px;
+    object-fit: cover;
+    border: 1px solid var(--border);
+}
+
+.preview-file {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-tertiary);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+}
+
+.preview-icon {
+    font-size: 1.5rem;
+    color: var(--accent);
+}
+
+.preview-info {
+    display: flex;
+    flex-direction: column;
+}
+
+.preview-name {
+    font-weight: 500;
+    color: var(--text-primary);
+    font-size: 0.9rem;
+}
+
+.preview-size {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.attachment-cancel-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 1.4rem;
+    cursor: pointer;
+    padding: 0.2rem 0.35rem;
+    line-height: 1;
+    flex-shrink: 0;
+}
+
+.attachment-cancel-btn:hover {
+    color: var(--text-primary);
+}
+
+/* Attachment block inside message bubbles */
+.attachment-msg {
+    margin-top: 0.4rem;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    overflow: hidden;
+    background: var(--bg-tertiary);
+}
+
+.attachment-image-preview {
+    display: block;
+    max-width: 100%;
+    max-height: 200px;
+    object-fit: contain;
+    cursor: pointer;
+    min-height: 40px;         /* visible even while loading */
+    background: var(--bg-secondary);
+}
+
+.img-loading-wrap {
+    position: relative;
+}
+
+.img-loading-hint {
+    display: block;
+    padding: 0.4rem 0.75rem;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
+.attachment-file {
+    padding: 0.6rem 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+}
+
+.attachment-filename {
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.download-btn {
+    display: block;
+    width: 100%;
+    border-radius: 0;
+    background: transparent;
+    border: none;
+    border-top: 1px solid var(--border);
+    color: var(--accent);
+    padding: 0.4rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background 0.2s;
+    text-align: center;
+}
+
+.download-btn:hover {
+    background: var(--bg-primary);
+}
+
+.download-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+/* ───────── Timer button & dropdown ───────── */
+
+.timer-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    cursor: pointer;
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    font-size: 1rem;
+    transition: all 0.2s;
+    flex-shrink: 0;
+    line-height: 1;
+    position: relative;
+}
+
+.timer-btn:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+.timer-btn.active {
+    color: #e85d5d;
+    border-color: #e85d5d;
+}
+
+.timer-btn .timer-badge {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    background: #e85d5d;
+    color: #fff;
+    font-size: 0.6rem;
+    border-radius: 4px;
+    padding: 1px 3px;
+    line-height: 1.2;
+    pointer-events: none;
+}
+
+.timer-dropdown {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.6rem 1rem;
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border);
+}
+
+.timer-dropdown-label {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    margin-right: 0.25rem;
+}
+
+.timer-option {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    border-radius: 4px;
+    padding: 0.25rem 0.6rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+.timer-option:hover,
+.timer-option.selected {
+    background: #e85d5d22;
+    border-color: #e85d5d;
+    color: #e85d5d;
+}
+
+/* ───────── Ephemeral message countdown ───────── */
+
+.ephemeral-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.72rem;
+    color: #e85d5d;
+    margin-top: 0.25rem;
+    opacity: 0.85;
+}
+
+.message.expiring-soon {
+    animation: expiry-pulse 1s ease-in-out infinite;
+}
+
+@keyframes expiry-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
+}

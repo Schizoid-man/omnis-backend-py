@@ -3,20 +3,45 @@ import hashlib
 import hmac
 import json
 import os
-from fastapi import FastAPI, HTTPException, Query, Header, Depends, WebSocket, WebSocketDisconnect
+import shutil
+import uuid
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Query, Header, Depends, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, desc
 from argon2 import PasswordHasher
 from models import Session as SessionModel
 from argon2.exceptions import VerifyMismatchError
 from datetime import datetime, timedelta, timezone
-from schema import AuthRequest, ChatRequest, MessageRequest, PublishRequest, PKeyResponse, SignupRequest, EpochRequest
+from schema import (
+    AuthRequest,
+    CallActionRequest,
+    CallInitiateRequest,
+    ChatRequest,
+    MessageRequest,
+    MediaInitRequest,
+    PublishRequest,
+    PKeyResponse,
+    SignupRequest,
+    EpochRequest,
+)
 import secrets
 
-from models import init_db, SessionLocal, User, Chat, Message, UserKey, ChatEpoch
+from models import init_db, SessionLocal, User, Chat, Message, UserKey, ChatEpoch, MediaAttachment, PendingUpload, Call
+
+# ── Media storage constants ───────────────────────────────────────────────────
+
+MEDIA_DIR = Path("./media")
+MAX_CHUNK_SIZE  = 5   * 1024 * 1024   # 5 MiB per chunk
+MAX_TOTAL_SIZE  = 200 * 1024 * 1024   # 200 MiB per file
 
 app = FastAPI()
+
+app.mount("/app", StaticFiles(directory="static", html=True), name="static")
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,11 +92,147 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+
+# ── Presence manager (one WS per logged-in user, for push notifications) ──────
+
+class PresenceManager:
+    """Tracks a single presence WebSocket per user_id.
+
+    Used exclusively for push notifications that must reach a user regardless
+    of which chat (if any) they have open — e.g. incoming call invites.
+    """
+
+    def __init__(self):
+        # user_id -> WebSocket
+        self.sockets: dict[int, WebSocket] = {}
+
+    async def connect(self, user_id: int, ws: WebSocket):
+        await ws.accept()
+        self.sockets[user_id] = ws
+
+    def disconnect(self, user_id: int):
+        self.sockets.pop(user_id, None)
+
+    async def send(self, user_id: int, payload: dict) -> bool:
+        """Send JSON to the user's presence socket.  Returns True on success."""
+        ws = self.sockets.get(user_id)
+        if not ws:
+            return False
+        try:
+            await ws.send_text(json.dumps(payload))
+            return True
+        except Exception:
+            self.sockets.pop(user_id, None)
+            return False
+
+
+# ── Call signaling manager (at most 2 parties per call) ───────────────────────
+
+class CallSignalingManager:
+    """Tracks signaling WebSocket connections for active calls.
+
+    call_id -> {user_id: WebSocket}
+    """
+
+    def __init__(self):
+        self.calls: dict[str, dict[int, WebSocket]] = {}
+
+    async def connect(self, call_id: str, user_id: int, ws: WebSocket):
+        await ws.accept()
+        self.calls.setdefault(call_id, {})[user_id] = ws
+
+    def disconnect(self, call_id: str, user_id: int):
+        conns = self.calls.get(call_id)
+        if conns:
+            conns.pop(user_id, None)
+            if not conns:
+                del self.calls[call_id]
+
+    async def broadcast(self, call_id: str, payload: dict, exclude_user_id: int | None = None):
+        conns = self.calls.get(call_id)
+        if not conns:
+            return
+        data = json.dumps(payload)
+        for uid, ws in list(conns.items()):
+            if uid == exclude_user_id:
+                continue
+            try:
+                await ws.send_text(data)
+            except Exception:
+                conns.pop(uid, None)
+
+
+# ── Call audio relay manager ──────────────────────────────────────────────────
+
+class CallAudioManager:
+    """Binary audio relay: forwards encrypted audio frames between two peers.
+
+    call_id -> {user_id: WebSocket}
+    Each binary frame received from one party is forwarded verbatim to the other.
+    """
+
+    def __init__(self):
+        self.calls: dict[str, dict[int, WebSocket]] = {}
+
+    async def connect(self, call_id: str, user_id: int, ws: WebSocket):
+        await ws.accept()
+        self.calls.setdefault(call_id, {})[user_id] = ws
+
+    def disconnect(self, call_id: str, user_id: int):
+        conns = self.calls.get(call_id)
+        if conns:
+            conns.pop(user_id, None)
+            if not conns:
+                del self.calls[call_id]
+
+    async def relay(self, call_id: str, sender_id: int, data: bytes):
+        """Forward raw bytes to the OTHER party in the call."""
+        conns = self.calls.get(call_id, {})
+        for uid, ws in list(conns.items()):
+            if uid == sender_id:
+                continue
+            try:
+                await ws.send_bytes(data)
+            except Exception:
+                conns.pop(uid, None)
+
+
+presence  = PresenceManager()
+call_sig  = CallSignalingManager()
+call_audio = CallAudioManager()
+
 # ── Startup ───────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 def startup():
     init_db()
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    # Background task: purge expired pending uploads every hour.
+    asyncio.ensure_future(_purge_expired_uploads())
+    # Background task: delete expired ephemeral messages every 5 seconds.
+    asyncio.ensure_future(_expire_messages())
+
+
+async def _purge_expired_uploads():
+    """Periodically delete pending upload sessions that have passed their expiry."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            db: Session = SessionLocal()
+            try:
+                stale = (
+                    db.query(PendingUpload)
+                    .filter(PendingUpload.expires_at < datetime.now(timezone.utc))
+                    .all()
+                )
+                for pu in stale:
+                    shutil.rmtree(pu.storage_dir, ignore_errors=True)
+                    db.delete(pu)
+                db.commit()
+            finally:
+                db.close()
+        except Exception:
+            pass  # Never crash the background task
 
 def get_db():
     db = SessionLocal()
@@ -80,8 +241,54 @@ def get_db():
     finally:
         db.close()
 
+
+async def _expire_messages():
+    """Periodically delete messages whose expires_at has passed and notify WS clients."""
+    while True:
+        await asyncio.sleep(5)
+        try:
+            db: Session = SessionLocal()
+            try:
+                now = datetime.now(timezone.utc)
+                expired = (
+                    db.query(Message)
+                    .filter(Message.expires_at.isnot(None), Message.expires_at <= now)
+                    .all()
+                )
+                for msg in expired:
+                    # Notify connected clients before deleting
+                    asyncio.ensure_future(manager.broadcast(
+                        msg.chat_id,
+                        {"type": "message_deleted", "message_id": msg.id},
+                    ))
+                    # Clean up linked media blob
+                    if msg.media_id:
+                        att = (
+                            db.query(MediaAttachment)
+                            .filter(MediaAttachment.id == msg.media_id)
+                            .one_or_none()
+                        )
+                        if att:
+                            blob = Path(att.storage_path)
+                            try:
+                                if blob.exists():
+                                    blob.unlink()
+                                parent = blob.parent
+                                if parent.exists() and not any(parent.iterdir()):
+                                    parent.rmdir()
+                            except OSError:
+                                pass
+                            db.delete(att)
+                    db.delete(msg)
+                if expired:
+                    db.commit()
+            finally:
+                db.close()
+        except Exception:
+            pass  # Never crash the background task
+
 try:
-    SERVER_KEY = os.environ.get("SERVER_KEY").encode("utf-8")
+    SERVER_KEY = "pls get job".encode("utf-8")
 except Exception:
     raise RuntimeError("SERVER_KEY environment variable must be set")
 
@@ -485,9 +692,11 @@ async def chat_ws(
                 "sender_id": m.sender_id,
                 "epoch_id": m.epoch_id,
                 "reply_id": m.reply_id,
+                "media_id": m.media_id,
                 "ciphertext": m.ciphertext,
                 "nonce": m.nonce,
                 "created_at": m.created_at.isoformat(),
+                "expires_at": m.expires_at.isoformat() if m.expires_at else None,
             }
             for m in messages
         ]
@@ -596,9 +805,11 @@ async def fetch_chat(
             "sender_id": m.sender_id,
             "epoch_id": m.epoch_id,
             "reply_id": m.reply_id,
+            "media_id": m.media_id,
             "ciphertext": m.ciphertext,
             "nonce": m.nonce,
             "created_at": m.created_at,
+            "expires_at": m.expires_at.isoformat() if m.expires_at else None,
         }
         for m in messages
     ]
@@ -831,13 +1042,39 @@ async def message(
             detail="Epoch not initialized",
         )
 
+    # If a media_id is provided, verify it belongs to this chat and was uploaded by the sender.
+    if payload.media_id is not None:
+        attachment = (
+            db.query(MediaAttachment)
+            .filter(MediaAttachment.id == payload.media_id)
+            .one_or_none()
+        )
+        if not attachment:
+            raise HTTPException(status_code=404, detail="Media attachment not found")
+        if attachment.chat_id != chat_id:
+            raise HTTPException(status_code=409, detail="Media attachment belongs to a different chat")
+        if attachment.uploader_id != user.id:
+            raise HTTPException(status_code=403, detail="Media attachment was not uploaded by you")
+
+    # Parse optional ephemeral expiry
+    expires_at = None
+    if payload.expires_at:
+        try:
+            expires_at = datetime.fromisoformat(payload.expires_at)
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            pass
+
     msg = Message(
         chat_id=chat.id,
         sender_id=user.id,
         epoch_id=payload.epoch_id,
         reply_id=payload.reply_id,
+        media_id=payload.media_id,
         ciphertext=payload.ciphertext,
         nonce=payload.nonce,
+        expires_at=expires_at,
     )
 
     db.add(msg)
@@ -852,9 +1089,11 @@ async def message(
             "sender_id": msg.sender_id,
             "epoch_id": msg.epoch_id,
             "reply_id": msg.reply_id,
+            "media_id": msg.media_id,
             "ciphertext": msg.ciphertext,
             "nonce": msg.nonce,
             "created_at": msg.created_at.isoformat(),
+            "expires_at": msg.expires_at.isoformat() if msg.expires_at else None,
         },
     }
     asyncio.ensure_future(manager.broadcast(chat_id, ws_payload))
@@ -862,5 +1101,521 @@ async def message(
     return {
         "id": msg.id,
         "epoch_id": msg.epoch_id,
+        "media_id": msg.media_id,
         "created_at": msg.created_at,
     }
+
+
+# ── Media endpoints ───────────────────────────────────────────────────────────
+
+@app.post("/media/upload/init", status_code=201)
+async def media_upload_init(
+    payload: MediaInitRequest,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """Begin a chunked encrypted-media upload session.
+
+    Validates chat membership, creates a staging directory, and returns an
+    upload_id the client uses for subsequent /chunk and /finalize calls.
+    The server never receives plaintext — clients must encrypt before uploading.
+    """
+    # Validate chat membership
+    chat = (
+        db.query(Chat)
+        .filter(
+            Chat.id == payload.chat_id,
+            or_(Chat.user_a_id == user.id, Chat.user_b_id == user.id),
+        )
+        .one_or_none()
+    )
+    if not chat:
+        raise HTTPException(status_code=403, detail="Not a participant of this chat")
+
+    upload_id = str(uuid.uuid4())
+    storage_dir = MEDIA_DIR / str(payload.chat_id) / upload_id
+    storage_dir.mkdir(parents=True, exist_ok=True)
+
+    pending = PendingUpload(
+        id=upload_id,
+        uploader_id=user.id,
+        chat_id=payload.chat_id,
+        total_size=payload.total_size,
+        chunk_size=payload.chunk_size,
+        total_chunks=payload.total_chunks,
+        chunks_received=0,
+        storage_dir=str(storage_dir),
+        file_type=payload.file_type,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+    )
+    db.add(pending)
+    db.commit()
+
+    return {"upload_id": upload_id}
+
+
+@app.put("/media/upload/{upload_id}/chunk/{chunk_index}")
+async def media_upload_chunk(
+    upload_id: str,
+    chunk_index: int,
+    request: Request,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """Upload a single chunk (raw encrypted bytes) for an in-progress upload session."""
+    pending = (
+        db.query(PendingUpload)
+        .filter(PendingUpload.id == upload_id)
+        .one_or_none()
+    )
+    if not pending:
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    if pending.uploader_id != user.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if chunk_index < 0 or chunk_index >= pending.total_chunks:
+        raise HTTPException(
+            status_code=400,
+            detail=f"chunk_index must be 0..{pending.total_chunks - 1}",
+        )
+
+    chunk_data = await request.body()
+    if not chunk_data:
+        raise HTTPException(status_code=400, detail="Empty chunk body")
+    if len(chunk_data) > MAX_CHUNK_SIZE:
+        raise HTTPException(status_code=413, detail="Chunk exceeds 5 MiB limit")
+
+    chunk_path = Path(pending.storage_dir) / f"chunk_{chunk_index:06d}"
+    chunk_path.write_bytes(chunk_data)
+
+    # Recount actual chunk files on disk (idempotent — handles retransmission)
+    received = len(list(Path(pending.storage_dir).glob("chunk_*")))
+    pending.chunks_received = received
+    db.commit()
+
+    return {
+        "chunk_index": chunk_index,
+        "chunks_remaining": pending.total_chunks - received,
+    }
+
+
+@app.post("/media/upload/{upload_id}/finalize", status_code=201)
+async def media_upload_finalize(
+    upload_id: str,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """Assemble all chunks into a single encrypted blob and create a MediaAttachment record."""
+    pending = (
+        db.query(PendingUpload)
+        .filter(PendingUpload.id == upload_id)
+        .one_or_none()
+    )
+    if not pending:
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    if pending.uploader_id != user.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    storage_dir = Path(pending.storage_dir)
+    chunk_files = sorted(storage_dir.glob("chunk_*"))
+
+    if len(chunk_files) != pending.total_chunks:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Incomplete upload: received {len(chunk_files)} of "
+                f"{pending.total_chunks} chunks"
+            ),
+        )
+
+    # Assemble chunks → blob
+    blob_path = storage_dir / "blob"
+    with blob_path.open("wb") as out:
+        for cf in chunk_files:
+            out.write(cf.read_bytes())
+            cf.unlink()
+    actual_size = blob_path.stat().st_size
+
+    attachment = MediaAttachment(
+        uploader_id=user.id,
+        chat_id=pending.chat_id,
+        storage_path=str(blob_path),
+        total_size=actual_size,
+        file_type=pending.file_type,
+    )
+    db.add(attachment)
+    db.flush()
+
+    media_id = attachment.id
+    db.delete(pending)
+    db.commit()
+
+    return {"media_id": media_id}
+
+
+@app.get("/media/{media_id}")
+async def media_download(
+    media_id: int,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """Stream an encrypted media blob. Only chat participants may download.
+
+    The response body is raw encrypted bytes (AES-256-GCM ciphertext).
+    The decryption key lives inside the linked message ciphertext and is
+    never transmitted in plaintext through the server.
+    """
+    attachment = (
+        db.query(MediaAttachment)
+        .filter(MediaAttachment.id == media_id)
+        .one_or_none()
+    )
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    # Only participants of the linked chat may download
+    chat = (
+        db.query(Chat)
+        .filter(
+            Chat.id == attachment.chat_id,
+            or_(Chat.user_a_id == user.id, Chat.user_b_id == user.id),
+        )
+        .one_or_none()
+    )
+    if not chat:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    blob_path = Path(attachment.storage_path)
+    if not blob_path.exists():
+        raise HTTPException(status_code=404, detail="Media file missing from disk")
+
+    return FileResponse(
+        path=str(blob_path),
+        media_type="application/octet-stream",
+        filename=f"attachment_{media_id}",
+    )
+
+
+@app.delete("/media/{media_id}")
+async def media_delete(
+    media_id: int,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """Delete a media attachment and its blob from disk. Only the uploader may delete."""
+    attachment = (
+        db.query(MediaAttachment)
+        .filter(MediaAttachment.id == media_id)
+        .one_or_none()
+    )
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Media not found")
+    if attachment.uploader_id != user.id:
+        raise HTTPException(status_code=403, detail="Only the uploader may delete this media")
+
+    # Remove the blob from disk
+    blob_path = Path(attachment.storage_path)
+    try:
+        if blob_path.exists():
+            blob_path.unlink()
+        parent = blob_path.parent
+        if parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
+    except OSError:
+        pass  # Best-effort; DB record is still removed
+
+    # Null-out references in messages so history still renders
+    (
+        db.query(Message)
+        .filter(Message.media_id == media_id)
+        .update({"media_id": None}, synchronize_session=False)
+    )
+
+    db.delete(attachment)
+    db.commit()
+
+    return {"status": "deleted"}
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# VoIP — Presence, Call Management, Signaling, Audio Relay
+# ════════════════════════════════════════════════════════════════════════════════
+
+# ── Presence WebSocket ────────────────────────────────────────────────────────
+
+@app.websocket("/user/ws")
+async def user_presence_ws(
+    websocket: WebSocket,
+    token: str = Query(...),
+    device_id: str = Query(...),
+):
+    """Persistent per-user presence socket.
+
+    The TUI connects here once after login.  The server pushes:
+      • {"type": "call_invite", "call_id": "...", "caller_username": "...", "initiated_at": "..."}
+      • {"type": "pong"} in response to {"type": "ping"}
+
+    No chat membership check is required — it is a user-scoped socket.
+    """
+    db: Session = SessionLocal()
+    try:
+        user = ws_authenticate(token, device_id, db)
+        if not user:
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
+
+        await presence.connect(user.id, websocket)
+        try:
+            while True:
+                data = await websocket.receive_text()
+                msg = json.loads(data)
+                if msg.get("type") == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+    finally:
+        presence.disconnect(user.id if user else -1)
+        db.close()
+
+
+# ── Call REST endpoints ───────────────────────────────────────────────────────
+
+@app.post("/call/initiate", status_code=201)
+async def call_initiate(
+    payload: CallInitiateRequest,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """Initiate a VoIP call to another user.
+
+    Creates a Call row with status "ringing" and pushes a call_invite frame
+    to the callee's presence WebSocket (if they are connected).
+    """
+    callee = (
+        db.query(User)
+        .filter(User.username == payload.callee_username)
+        .one_or_none()
+    )
+    if not callee:
+        raise HTTPException(status_code=404, detail="User not found")
+    if callee.id == user.id:
+        raise HTTPException(status_code=400, detail="Cannot call yourself")
+
+    import uuid as _uuid
+    call_id = str(_uuid.uuid4())
+    now = datetime.now(timezone.utc)
+
+    call = Call(
+        id=call_id,
+        caller_id=user.id,
+        callee_id=callee.id,
+        chat_id=payload.chat_id,
+        status="ringing",
+        initiated_at=now,
+    )
+    db.add(call)
+    db.commit()
+
+    # Push invite to callee's presence socket (best-effort)
+    asyncio.ensure_future(presence.send(callee.id, {
+        "type": "call_invite",
+        "call_id": call_id,
+        "caller_username": user.username,
+        "initiated_at": now.isoformat(),
+    }))
+
+    return {
+        "call_id": call_id,
+        "status": "ringing",
+        "caller_username": user.username,
+        "callee_username": callee.username,
+    }
+
+
+@app.post("/call/answer")
+async def call_answer(
+    payload: CallActionRequest,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    call = db.query(Call).filter(Call.id == payload.call_id).one_or_none()
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    if call.callee_id != user.id:
+        raise HTTPException(status_code=403, detail="Only the callee may answer")
+    if call.status != "ringing":
+        raise HTTPException(status_code=409, detail=f"Call is already {call.status}")
+
+    now = datetime.now(timezone.utc)
+    call.status = "active"
+    call.answered_at = now
+    db.commit()
+
+    # Notify both parties via signaling WS
+    asyncio.ensure_future(call_sig.broadcast(payload.call_id, {
+        "type": "answered",
+        "call_id": payload.call_id,
+        "answered_at": now.isoformat(),
+    }))
+
+    return {"status": "active"}
+
+
+@app.post("/call/reject")
+async def call_reject(
+    payload: CallActionRequest,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    call = db.query(Call).filter(Call.id == payload.call_id).one_or_none()
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    if call.callee_id != user.id and call.caller_id != user.id:
+        raise HTTPException(status_code=403, detail="Not a participant")
+    if call.status not in ("ringing",):
+        raise HTTPException(status_code=409, detail=f"Call is already {call.status}")
+
+    call.status = "rejected"
+    call.ended_at = datetime.now(timezone.utc)
+    db.commit()
+
+    asyncio.ensure_future(call_sig.broadcast(payload.call_id, {
+        "type": "rejected",
+        "call_id": payload.call_id,
+    }))
+
+    return {"status": "rejected"}
+
+
+@app.post("/call/end")
+async def call_end(
+    payload: CallActionRequest,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    call = db.query(Call).filter(Call.id == payload.call_id).one_or_none()
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    if call.callee_id != user.id and call.caller_id != user.id:
+        raise HTTPException(status_code=403, detail="Not a participant")
+
+    now = datetime.now(timezone.utc)
+    if call.status not in ("ended", "rejected", "missed"):
+        call.status = "ended"
+        call.ended_at = now
+        db.commit()
+
+    asyncio.ensure_future(call_sig.broadcast(payload.call_id, {
+        "type": "ended",
+        "call_id": payload.call_id,
+        "ended_at": now.isoformat(),
+    }))
+
+    return {"status": "ended"}
+
+
+# ── Call signaling WebSocket ──────────────────────────────────────────────────
+
+@app.websocket("/call/ws/{call_id}")
+async def call_signaling_ws(
+    websocket: WebSocket,
+    call_id: str,
+    token: str = Query(...),
+    device_id: str = Query(...),
+):
+    """Bidirectional call signaling socket.
+
+    Both caller and callee connect here after the call is initiated.
+    The server relays JSON control frames between the two parties:
+      {"type": "answered"} {"type": "rejected"} {"type": "ended"}
+      {"type": "hold"}     {"type": "unhold"}   {"type": "pong"}
+    """
+    db: Session = SessionLocal()
+    user = None
+    try:
+        user = ws_authenticate(token, device_id, db)
+        if not user:
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
+
+        call = db.query(Call).filter(Call.id == call_id).one_or_none()
+        if not call or (user.id != call.caller_id and user.id != call.callee_id):
+            await websocket.close(code=4004, reason="Call not found or not a participant")
+            return
+
+        await call_sig.connect(call_id, user.id, websocket)
+
+        while True:
+            try:
+                raw = await websocket.receive_text()
+                msg = json.loads(raw)
+                t = msg.get("type", "")
+                if t == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+                elif t in ("hold", "unhold", "ended", "rejected"):
+                    # Relay to the other party
+                    await call_sig.broadcast(call_id, msg, exclude_user_id=user.id)
+                    # If ended/rejected, update DB
+                    if t in ("ended", "rejected") and call.status not in ("ended", "rejected", "missed"):
+                        call.status = t
+                        call.ended_at = datetime.now(timezone.utc)
+                        db.commit()
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
+    finally:
+        if user:
+            call_sig.disconnect(call_id, user.id)
+        db.close()
+
+
+# ── Call audio relay WebSocket ────────────────────────────────────────────────
+
+@app.websocket("/call/audio/ws/{call_id}")
+async def call_audio_ws(
+    websocket: WebSocket,
+    call_id: str,
+    token: str = Query(...),
+    device_id: str = Query(...),
+):
+    """Binary audio relay socket.
+
+    Each binary frame is forwarded verbatim to the other party.
+    Frame format (enforced client-side):
+      [8 bytes seq u64 LE] [12 bytes AES-GCM nonce] [ciphertext+tag bytes]
+
+    The server never inspects the encrypted audio payload.
+    """
+    db: Session = SessionLocal()
+    user = None
+    try:
+        user = ws_authenticate(token, device_id, db)
+        if not user:
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
+
+        call = db.query(Call).filter(Call.id == call_id).one_or_none()
+        if not call or (user.id != call.caller_id and user.id != call.callee_id):
+            await websocket.close(code=4004, reason="Call not found or not a participant")
+            return
+        if call.status not in ("active", "ringing"):
+            await websocket.close(code=4003, reason="Call not active")
+            return
+
+        await websocket.accept()
+        call_audio.calls.setdefault(call_id, {})[user.id] = websocket
+
+        while True:
+            try:
+                raw = await websocket.receive_bytes()
+                await call_audio.relay(call_id, user.id, raw)
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
+    finally:
+        if user:
+            call_audio.disconnect(call_id if call_id else "", user.id)
+        db.close()
