@@ -41,3 +41,19 @@ class PublishRequest(BaseModel):
 class PKeyResponse(BaseModel):
     username: str
     identity_pub: str
+
+
+# ── VoIP call schemas ─────────────────────────────────────────────────────────
+
+class CallInitiateRequest(BaseModel):
+    callee_username: str
+    chat_id: Optional[int] = None
+
+class CallActionRequest(BaseModel):
+    call_id: str
+
+class CallInitiateResponse(BaseModel):
+    call_id: str
+    status: str
+    caller_username: str
+    callee_username: str

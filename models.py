@@ -200,6 +200,22 @@ class Message(Base):
 UPLOAD_DIR = "uploads"
 
 
+class Call(Base):
+    """Tracks VoIP calls between two users."""
+    __tablename__ = "calls"
+
+    id            = Column(String(36), primary_key=True)   # UUID
+    caller_id     = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    callee_id     = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    # Optional: the chat the call was initiated from.
+    chat_id       = Column(Integer, ForeignKey("chats.id", ondelete="SET NULL"), nullable=True)
+    # ringing | active | ended | rejected | missed
+    status        = Column(String(16), nullable=False, default="ringing")
+    initiated_at  = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    answered_at   = Column(DateTime, nullable=True)
+    ended_at      = Column(DateTime, nullable=True)
+
+
 def init_db():
     import os
     os.makedirs(UPLOAD_DIR, exist_ok=True)

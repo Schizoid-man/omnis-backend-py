@@ -15,10 +15,10 @@ from argon2 import PasswordHasher
 from models import Session as SessionModel
 from argon2.exceptions import VerifyMismatchError
 from datetime import datetime, timedelta, timezone
-from schema import AuthRequest, ChatRequest, MessageRequest, PublishRequest, PKeyResponse, SignupRequest, EpochRequest
+from schema import AuthRequest, ChatRequest, MessageRequest, PublishRequest, PKeyResponse, SignupRequest, EpochRequest, CallInitiateRequest, CallActionRequest
 import secrets
 
-from models import init_db, SessionLocal, User, Chat, Message, UserKey, ChatEpoch, Media, MessageMedia, UPLOAD_DIR
+from models import init_db, SessionLocal, User, Chat, Message, UserKey, ChatEpoch, Media, MessageMedia, UPLOAD_DIR, Call
 
 MAX_CHUNK_SIZE = 256 * 1024 * 1024  # 256 MiB
 
@@ -75,6 +75,115 @@ class ConnectionManager:
             chat_conns.pop(uid, None)
 
 manager = ConnectionManager()
+
+
+# ── Presence manager (one WS per logged-in user, for push notifications) ──────
+
+class PresenceManager:
+    """Tracks a single presence WebSocket per user_id.
+
+    Used exclusively for push notifications that must reach a user regardless
+    of which chat (if any) they have open — e.g. incoming call invites.
+    """
+
+    def __init__(self):
+        # user_id -> WebSocket
+        self.sockets: dict[int, WebSocket] = {}
+
+    async def connect(self, user_id: int, ws: WebSocket):
+        await ws.accept()
+        self.sockets[user_id] = ws
+
+    def disconnect(self, user_id: int):
+        self.sockets.pop(user_id, None)
+
+    async def send(self, user_id: int, payload: dict) -> bool:
+        """Send JSON to the user's presence socket.  Returns True on success."""
+        ws = self.sockets.get(user_id)
+        if not ws:
+            return False
+        try:
+            await ws.send_text(json.dumps(payload))
+            return True
+        except Exception:
+            self.sockets.pop(user_id, None)
+            return False
+
+
+# ── Call signaling manager (at most 2 parties per call) ───────────────────────
+
+class CallSignalingManager:
+    """Tracks signaling WebSocket connections for active calls.
+
+    call_id -> {user_id: WebSocket}
+    """
+
+    def __init__(self):
+        self.calls: dict[str, dict[int, WebSocket]] = {}
+
+    async def connect(self, call_id: str, user_id: int, ws: WebSocket):
+        await ws.accept()
+        self.calls.setdefault(call_id, {})[user_id] = ws
+
+    def disconnect(self, call_id: str, user_id: int):
+        conns = self.calls.get(call_id)
+        if conns:
+            conns.pop(user_id, None)
+            if not conns:
+                del self.calls[call_id]
+
+    async def broadcast(self, call_id: str, payload: dict, exclude_user_id: int | None = None):
+        conns = self.calls.get(call_id)
+        if not conns:
+            return
+        data = json.dumps(payload)
+        for uid, ws in list(conns.items()):
+            if uid == exclude_user_id:
+                continue
+            try:
+                await ws.send_text(data)
+            except Exception:
+                conns.pop(uid, None)
+
+
+# ── Call audio relay manager ──────────────────────────────────────────────────
+
+class CallAudioManager:
+    """Binary audio relay: forwards encrypted audio frames between two peers.
+
+    call_id -> {user_id: WebSocket}
+    Each binary frame received from one party is forwarded verbatim to the other.
+    """
+
+    def __init__(self):
+        self.calls: dict[str, dict[int, WebSocket]] = {}
+
+    async def connect(self, call_id: str, user_id: int, ws: WebSocket):
+        await ws.accept()
+        self.calls.setdefault(call_id, {})[user_id] = ws
+
+    def disconnect(self, call_id: str, user_id: int):
+        conns = self.calls.get(call_id)
+        if conns:
+            conns.pop(user_id, None)
+            if not conns:
+                del self.calls[call_id]
+
+    async def relay(self, call_id: str, sender_id: int, data: bytes):
+        """Forward raw bytes to the OTHER party in the call."""
+        conns = self.calls.get(call_id, {})
+        for uid, ws in list(conns.items()):
+            if uid == sender_id:
+                continue
+            try:
+                await ws.send_bytes(data)
+            except Exception:
+                conns.pop(uid, None)
+
+
+presence  = PresenceManager()
+call_sig  = CallSignalingManager()
+call_audio = CallAudioManager()
 
 # ── Startup ───────────────────────────────────────────────────────────
 
@@ -1214,3 +1323,289 @@ async def message(
         "created_at": msg.created_at,
         "attachments": attachments,
     }
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# VoIP — Presence, Call Management, Signaling, Audio Relay
+# ════════════════════════════════════════════════════════════════════════════════
+
+# ── Presence WebSocket ────────────────────────────────────────────────────────
+
+@app.websocket("/user/ws")
+async def user_presence_ws(
+    websocket: WebSocket,
+    token: str = Query(...),
+    device_id: str = Query(...),
+):
+    """Persistent per-user presence socket.
+
+    The TUI connects here once after login.  The server pushes:
+      • {"type": "call_invite", "call_id": "...", "caller_username": "...", "initiated_at": "..."}
+      • {"type": "pong"} in response to {"type": "ping"}
+
+    No chat membership check is required — it is a user-scoped socket.
+    """
+    db: Session = SessionLocal()
+    user = None
+    try:
+        user = ws_authenticate(token, device_id, db)
+        if not user:
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
+
+        await presence.connect(user.id, websocket)
+        try:
+            while True:
+                data = await websocket.receive_text()
+                msg = json.loads(data)
+                if msg.get("type") == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+    finally:
+        presence.disconnect(user.id if user else -1)
+        db.close()
+
+
+# ── Call REST endpoints ───────────────────────────────────────────────────────
+
+@app.post("/call/initiate", status_code=201)
+async def call_initiate(
+    payload: CallInitiateRequest,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """Initiate a VoIP call to another user.
+
+    Creates a Call row with status "ringing" and pushes a call_invite frame
+    to the callee's presence WebSocket (if they are connected).
+    """
+    callee = (
+        db.query(User)
+        .filter(User.username == payload.callee_username)
+        .one_or_none()
+    )
+    if not callee:
+        raise HTTPException(status_code=404, detail="User not found")
+    if callee.id == user.id:
+        raise HTTPException(status_code=400, detail="Cannot call yourself")
+
+    import uuid as _uuid
+    call_id = str(_uuid.uuid4())
+    now = datetime.now(timezone.utc)
+
+    call = Call(
+        id=call_id,
+        caller_id=user.id,
+        callee_id=callee.id,
+        chat_id=payload.chat_id,
+        status="ringing",
+        initiated_at=now,
+    )
+    db.add(call)
+    db.commit()
+
+    # Push invite to callee's presence socket (best-effort)
+    asyncio.ensure_future(presence.send(callee.id, {
+        "type": "call_invite",
+        "call_id": call_id,
+        "caller_username": user.username,
+        "initiated_at": now.isoformat(),
+    }))
+
+    return {
+        "call_id": call_id,
+        "status": "ringing",
+        "caller_username": user.username,
+        "callee_username": callee.username,
+    }
+
+
+@app.post("/call/answer")
+async def call_answer(
+    payload: CallActionRequest,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    call = db.query(Call).filter(Call.id == payload.call_id).one_or_none()
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    if call.callee_id != user.id:
+        raise HTTPException(status_code=403, detail="Only the callee may answer")
+    if call.status != "ringing":
+        raise HTTPException(status_code=409, detail=f"Call is already {call.status}")
+
+    now = datetime.now(timezone.utc)
+    call.status = "active"
+    call.answered_at = now
+    db.commit()
+
+    # Notify both parties via signaling WS
+    asyncio.ensure_future(call_sig.broadcast(payload.call_id, {
+        "type": "answered",
+        "call_id": payload.call_id,
+        "answered_at": now.isoformat(),
+    }))
+
+    return {"status": "active"}
+
+
+@app.post("/call/reject")
+async def call_reject(
+    payload: CallActionRequest,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    call = db.query(Call).filter(Call.id == payload.call_id).one_or_none()
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    if call.callee_id != user.id and call.caller_id != user.id:
+        raise HTTPException(status_code=403, detail="Not a participant")
+    if call.status not in ("ringing",):
+        raise HTTPException(status_code=409, detail=f"Call is already {call.status}")
+
+    call.status = "rejected"
+    call.ended_at = datetime.now(timezone.utc)
+    db.commit()
+
+    asyncio.ensure_future(call_sig.broadcast(payload.call_id, {
+        "type": "rejected",
+        "call_id": payload.call_id,
+    }))
+
+    return {"status": "rejected"}
+
+
+@app.post("/call/end")
+async def call_end(
+    payload: CallActionRequest,
+    user: User = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    call = db.query(Call).filter(Call.id == payload.call_id).one_or_none()
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    if call.callee_id != user.id and call.caller_id != user.id:
+        raise HTTPException(status_code=403, detail="Not a participant")
+
+    now = datetime.now(timezone.utc)
+    if call.status not in ("ended", "rejected", "missed"):
+        call.status = "ended"
+        call.ended_at = now
+        db.commit()
+
+    asyncio.ensure_future(call_sig.broadcast(payload.call_id, {
+        "type": "ended",
+        "call_id": payload.call_id,
+        "ended_at": now.isoformat(),
+    }))
+
+    return {"status": "ended"}
+
+
+# ── Call signaling WebSocket ──────────────────────────────────────────────────
+
+@app.websocket("/call/ws/{call_id}")
+async def call_signaling_ws(
+    websocket: WebSocket,
+    call_id: str,
+    token: str = Query(...),
+    device_id: str = Query(...),
+):
+    """Bidirectional call signaling socket.
+
+    Both caller and callee connect here after the call is initiated.
+    The server relays JSON control frames between the two parties:
+      {"type": "answered"} {"type": "rejected"} {"type": "ended"}
+      {"type": "hold"}     {"type": "unhold"}   {"type": "pong"}
+    """
+    db: Session = SessionLocal()
+    user = None
+    try:
+        user = ws_authenticate(token, device_id, db)
+        if not user:
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
+
+        call = db.query(Call).filter(Call.id == call_id).one_or_none()
+        if not call or (user.id != call.caller_id and user.id != call.callee_id):
+            await websocket.close(code=4004, reason="Call not found or not a participant")
+            return
+
+        await call_sig.connect(call_id, user.id, websocket)
+
+        while True:
+            try:
+                raw = await websocket.receive_text()
+                msg = json.loads(raw)
+                t = msg.get("type", "")
+                if t == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+                elif t in ("hold", "unhold", "ended", "rejected"):
+                    # Relay to the other party
+                    await call_sig.broadcast(call_id, msg, exclude_user_id=user.id)
+                    # If ended/rejected, update DB
+                    if t in ("ended", "rejected") and call.status not in ("ended", "rejected", "missed"):
+                        call.status = t
+                        call.ended_at = datetime.now(timezone.utc)
+                        db.commit()
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
+    finally:
+        if user:
+            call_sig.disconnect(call_id, user.id)
+        db.close()
+
+
+# ── Call audio relay WebSocket ────────────────────────────────────────────────
+
+@app.websocket("/call/audio/ws/{call_id}")
+async def call_audio_ws(
+    websocket: WebSocket,
+    call_id: str,
+    token: str = Query(...),
+    device_id: str = Query(...),
+):
+    """Binary audio relay socket.
+
+    Each binary frame is forwarded verbatim to the other party.
+    Frame format (enforced client-side):
+      [8 bytes seq u64 LE] [12 bytes AES-GCM nonce] [ciphertext+tag bytes]
+
+    The server never inspects the encrypted audio payload.
+    """
+    db: Session = SessionLocal()
+    user = None
+    try:
+        user = ws_authenticate(token, device_id, db)
+        if not user:
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
+
+        call = db.query(Call).filter(Call.id == call_id).one_or_none()
+        if not call or (user.id != call.caller_id and user.id != call.callee_id):
+            await websocket.close(code=4004, reason="Call not found or not a participant")
+            return
+        if call.status not in ("active", "ringing"):
+            await websocket.close(code=4003, reason="Call not active")
+            return
+
+        await websocket.accept()
+        call_audio.calls.setdefault(call_id, {})[user.id] = websocket
+
+        while True:
+            try:
+                raw = await websocket.receive_bytes()
+                await call_audio.relay(call_id, user.id, raw)
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
+    finally:
+        if user:
+            call_audio.disconnect(call_id if call_id else "", user.id)
+        db.close()
